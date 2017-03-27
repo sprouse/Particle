@@ -10,7 +10,7 @@
 
 // GPS
 #include "inc/Adafruit_GPS.h"
-#include "inc/LIS3DH.h"
+//#include "inc/LIS3DH.h"
 #include "inc/GPS_Math.h"
 
 // Cellular Location
@@ -23,7 +23,6 @@ const char server[] = "data.sparkfun.com"; // Phant destination server
 
 #define GPSSerial Serial1
 Adafruit_GPS GPS(&GPSSerial);
-LIS3DH accel(SPI, A2, WKP);
 FuelGauge fuel;
 Phant phant(server, publicKey, privateKey); // Create a Phant object
 
@@ -68,9 +67,6 @@ unsigned int CELL_LOCATION_TIMEOUT = (10 * 1000);
 unsigned int CELL_LOCATION_REQ_ACCURACY = 100;
 unsigned int CELL_LOCATION_IGNORE_ACCURACY = 5000;
 
-// if no motion for 10 minutes, sleep! (milliseconds)
-unsigned int NO_MOTION_IDLE_SLEEP_DELAY = (10 * 60 * 1000);
-
 // lets wakeup every 6 hours and check in (seconds)
 unsigned int HOW_LONG_SHOULD_WE_SLEEP = (1 * 60 * 60);
 
@@ -82,18 +78,6 @@ unsigned int SLEEP_TIME = 3600; // Sleep for an hour by default
 // lets set this to less than our sleep time, so we always idle check in.
 // (seconds)
 int MAX_IDLE_CHECKIN_DELAY = (HOW_LONG_SHOULD_WE_SLEEP - 60);
-
-void initAccel() {
-    Serial.println("Accel: Initialising...");
-
-    pinMode(WKP, INPUT_PULLUP);
-
-    if (!accel.setupLowPowerWakeMode(16)) {
-        Serial.println("Accel: Unable to configure wake mode!");
-    }
-    accel.enableTemperature();
-    ACCEL_INITED = true;
-}
 
 bool gpsActivated() {
     return GPS_ACTIVE;
@@ -167,13 +151,38 @@ int transmitStatus(String command) {
 }
 
 
-int postToPhant(int batt, String loc)
+int postToPhant()
 {
         // Use phant.add(<field>, <value>) to add data to each field.
         // Phant requires you to update each and every field before posting,
         // make sure all fields defined in the stream are added here.
-    phant.add("batt", batt);
-    phant.add("loc", loc);
+    String latitude;
+    String longitude;
+    String q;
+    String fix;
+
+    if(!GPS.fix && is_cell_locate_accurate(_cell_locate,CELL_LOCATION_IGNORE_ACCURACY)) {
+        latitude = String(_cell_locate.lat);
+        longitude = String(_cell_locate.lng);
+        q = String(_cell_locate.uncertainty);
+        fix = "C";
+    } else if (GPS.fix) {
+        latitude = String(convertDegMinToDecDeg(GPS.latitude));
+        longitude = "-" + String(convertDegMinToDecDeg(GPS.longitude));
+        fix = "G";
+        q = String(GPS.fixquality);
+    } else {
+        latitude = "Unknown";
+        longitude = "Unknown";
+        fix = "U";
+        q = String(0);
+    }
+
+    phant.add("fix", fix);
+    phant.add("lat", latitude);
+    phant.add("lon", longitude);
+    phant.add("qual", q);
+
         
     TCPClient client;
     char response[512];
@@ -232,17 +241,15 @@ int postToPhant(int batt, String loc)
 
 int publishMode(String mode);
 void button_clicked(system_event_t event, int param);
-String loc_message = "Uninitialized";
 
 void setup() {
     Serial.begin(9600);
+    Serial.println("Booting");
     lastMotion = 0;
     lastMMessage = 0;
     lastPublish = 0;
     lastCellLocation = 0;
     lastGPSVar = 0;
-
-    initAccel();
 
     // for blinking.
     pinMode(D7, OUTPUT);
@@ -251,14 +258,21 @@ void setup() {
     Particle.function("publish", publishMode);
 
     // Setup manual sleep button clicks
-    System.on(button_final_click, button_clicked);
+    // System.on(button_final_click, button_clicked);
 
 
     // Setup function to send power status
     Particle.function("tstat", transmitStatus);
 
     lastGPSVar = 0;
-    Particle.variable("Loc", loc_message);
+    
+    Serial.println("Turning on GPS");
+    activateGPS();
+    Serial.println("Turning on Cellular");
+    Cellular.on();
+    Serial.println("Particle Connecting");
+    Particle.connect();
+    Serial.println("Setup Complete");
 }
 
 
@@ -295,10 +309,6 @@ void sleep() {
     lastMotion = 0;
     lastCellLocation = 0;
 
-    // Turn off D7 (motion indicator)
-    Serial.println("Sleep: Turning off D7 LED...");
-    digitalWrite(D7, LOW);
-
     // Turn off Cellular modem and GPS
     Serial.println("Sleep: Deactivating GPS...");
     deactivateGPS();
@@ -311,8 +321,6 @@ void sleep() {
     Serial.println("Sleep: Turning off battery gauge...");
     fuel.sleep();
 
-    // reset the accelerometer interrupt so we can sleep without instantly waking
-    bool awake = ((accel.clearInterrupt() & accel.INT1_SRC_IA) != 0);
     System.sleep(SLEEP_MODE_DEEP, HOW_LONG_SHOULD_WE_SLEEP);
 }
 
@@ -322,8 +330,7 @@ void button_clicked(system_event_t event, int param)
         int times = system_button_clicks(param);
         Serial.printlnf("Button %d pressed %d times...", times, param);
         if(times == 4) {
-            Serial.println("Manually deep sleeping for 21600s but will wake up for motion...");
-            // reset the accelerometer interrupt so we can sleep without instantly waking
+            Serial.println("Manually deep sleeping for 21600sn...");
             TIME_TO_SLEEP = true;
         } else {
             Serial.printlnf("Mode button %d clicks is unknown! Maybe this is a system handled number?", event);
@@ -389,7 +396,6 @@ void publishLocation() {
             lastPublish = now;
 
             unsigned int msSinceLastMotion = (now - lastMotion);
-            int motionInTheLastMinute = (msSinceLastMotion < 60000);
 
             if(!GPS.fix && is_cell_locate_accurate(_cell_locate,CELL_LOCATION_IGNORE_ACCURACY)) {
                 Serial.println("Publish: No GPS Fix, reporting Cellular location...");
@@ -400,11 +406,9 @@ void publishLocation() {
                     + ",\"q\":"        + String(_cell_locate.uncertainty)
                     + ",\"t\":\"gsm\""
                     + ",\"spd\":"      + String(_cell_locate.speed)
-                    + ",\"mot\":"      + String(motionInTheLastMinute)
                     + ",\"s\": 0"
                     + ",\"vcc\":"      + String(fuel.getVCell())
                     + ",\"soc\":"      + String(fuel.getSoC())
-                    + ",\"tmp\":"      + String(accel.getTemperature())
                     + "}";
                 Particle.publish(PREFIX + String("l"), loc_data, 60, PRIVATE);
             } else if (GPS.fix) {
@@ -416,54 +420,14 @@ void publishLocation() {
                     + ",\"q\":"        + String(GPS.fixquality)
                     + ",\"t\":\"gps\""
                     + ",\"spd\":"      + String(GPS.speed * 0.514444)
-                    + ",\"mot\":"      + String(motionInTheLastMinute)
                     + ",\"s\": "       + String(GPS.satellites)
                     + ",\"vcc\":"      + String(fuel.getVCell())
                     + ",\"soc\":"      + String(fuel.getSoC())
-                    + ",\"tmp\":"      + String(accel.getTemperature())
                     + "}";
                 Particle.publish(PREFIX + String("l"), loc_data, 60, PRIVATE);
             } else {
                 Particle.publish(PREFIX + String("s"), "no_fix", 60, PRIVATE);
             }
-        }
-    }
-}
-
-
-bool hasMotion() {
-   // bool motion = digitalRead(WKP);
-
-    uint8_t regValue = accel.readRegister8(accel.REG_INT1_SRC);
-    bool motion = ((regValue & accel.INT1_SRC_IA) != 0);
-
-    digitalWrite(D7, (motion) ? HIGH : LOW);
-
-    if (motion) {
-        initAccel();
-    }
-
-    return motion;
-}
-
-
-void checkMotion(unsigned long now) {
-    if(hasMotion()) {
-        Serial.printlnf("checkMotion: BUMP - Setting lastMotion to %d", now);
-
-        lastMotion = now;
-
-        // Activate GPS module if inactive
-        if(!gpsActivated()) {
-            activateGPS();
-        }
-
-        if (Particle.connected() == false) {
-            // Init GPS now, gives the module a little time to fix while particle connects
-            Serial.println("checkMotion: Connecting...");
-            Cellular.on();
-            Particle.connect();
-            Particle.publish(PREFIX + String("s"), "motion_checkin", 1800, PRIVATE);
         }
     }
 }
@@ -545,18 +509,6 @@ void idleReDeactivateGPS() {
 }
 
 
-void idleSleep(unsigned long now) {
-    // Make sure this is valid
-    unsigned long since_last_motion = now - lastMotion;
-
-    if ((0 < since_last_motion) && (since_last_motion > NO_MOTION_IDLE_SLEEP_DELAY)) {
-        Serial.printlnf("No motion in %d ms, sleeping...", since_last_motion);
-        // hey, it's been longer than xx minutes and nothing is happening, lets go to sleep.
-        // if the accel triggers an interrupt, we'll wakeup earlier than that.
-        TIME_TO_SLEEP = true;
-    }
-}
-
 int phant_count = 0;
 unsigned long last_phant = 0;
 
@@ -573,22 +525,11 @@ void loop() {
     if (lastGPSVar > now) { lastGPSVar = now; }
     if (last_phant > now) { last_phant = now; }
 
-    // if (now - last_phant > 15000) {
-        // postToPhant(phant_count);
-        // Serial.printlnf("Phant: %d", phant_count);
-        // phant_count++;
-        // last_phant = now;
-    // }
-
-    if(!ACCEL_INITED) {
-        initAccel();
+    if ((now - last_phant) > 5000){
+        Serial.printlnf("loop %d", phant_count++);
+        last_phant = now;
     }
 
-    /* Check to see if we've seen any motion
-     * if so, enable GPS, connect, reset timers. This order gives time for
-     * GPS to start while we connect
-     */
-    checkMotion(now);
 
     /* If we havent idle checked in in a long time, do it now.
      * This enables GPS, connects, resets idle timer and sends
@@ -607,17 +548,9 @@ void loop() {
      * <interval> */
     publishLocation();
 
-    if ((chargePort()==0) && (now - lastMMessage) > 10000) {
-        Serial.printlnf("Sleeping in %ds due to no motion...", ((NO_MOTION_IDLE_SLEEP_DELAY - (now - lastMotion)) / 1000));
-        lastMMessage = now;
-    }
-
-    if ((now - lastGPSVar) > 1000 * 15) {
-      loc_message = String(convertDegMinToDecDeg(GPS.latitude)) \
-                    + ", -" \
-                    + String(convertDegMinToDecDeg(GPS.longitude));
+    if ((now - lastGPSVar) > 1000 * 30) {
+      postToPhant();
       lastGPSVar = now;
-      postToPhant(1, loc_message);
     }
 
     /* Deactivate GPS if we haven't got a lock in <interval> minutes.
@@ -625,25 +558,9 @@ void loop() {
      * to be turned off if we can't get a fix but movement is still
      * occurring. Report GSM location only */
 
-    //STS Disable this for now idleReDeactivateGPS();
-
-    // If less than 20% battery, turn off accelerometer interrupt if it isn't already off
-    if(fuel.getSoC() < 20) {
-        // Disable interrupts
-
-        // Rely on idle timeout to check in every x hours
-    }
-
-    // use "now" instead of millis...  If it takes us a REALLY long time to connect, we don't want to
-    // accidentally idle out.
-    // Only allow sleep when power is removed.
-    // if (chargePort() == 0){
-      // idleSleep(now);
+    // if(TIME_TO_SLEEP) {
+        // sleep();
     // }
-
-    if(TIME_TO_SLEEP) {
-        sleep();
-    }
 
     delay(10);
 }
